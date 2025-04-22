@@ -1,0 +1,85 @@
+import pandas as pd
+import matplotlib.pyplot as plt
+
+# Read Excel file
+file_path = "Tee_beam.xlsx"
+inputs = pd.read_excel(file_path, sheet_name="Inputs")
+load_cases = pd.read_excel(file_path, sheet_name="Live load")
+vehicles = pd.read_excel(file_path, sheet_name="Vehicle Loads")
+
+# Create dictionary from Inputs sheet
+input_dict = {}
+for i in range(len(inputs)):
+    key = str(inputs.loc[i, "Parameter Name"]).strip().lower()
+    value = str(inputs.loc[i, "Value"]).strip()
+    input_dict[key] = value
+
+# Get selected load case and vehicle substitution
+selected_case = input_dict.get("load case", "").title()
+substitute_vehicle = input_dict.get("type of vehicle", "").title()
+
+# Get dimensions
+carriageway_width = float(input_dict.get("carriageway width", 21))
+tee_spacing = float(input_dict.get("tee beam spacing", 3))
+cross_spacing = float(input_dict.get("cross girder spacing", 5))
+bridge_span = float(input_dict.get("bridge span", 16))
+
+# Filter the selected row from load_cases
+selected_row = load_cases[load_cases["Case Name"].str.lower() == selected_case.lower()]
+if selected_row.empty:
+    print("Load case not found")
+else:
+    selected_row = selected_row.iloc[0]
+
+# Create lane-wise vehicle list
+lane_vehicles = []
+for i in range(1, 7):
+    lane_name = "Lane " + str(i)
+    vehicle = selected_row[lane_name]
+    if str(vehicle).lower() == "class 70r":
+        vehicle = substitute_vehicle
+    if str(vehicle).lower() != "empty":
+        lane_vehicles.append((lane_name, vehicle))
+
+# Get vehicle details
+lane_details = []
+for lane, vtype in lane_vehicles:
+    match = vehicles[vehicles["Vehicle Type"].str.lower() == vtype.lower()]
+    if not match.empty:
+        row = match.iloc[0].to_dict()
+        row["Lane"] = lane
+        lane_details.append(row)
+
+# Convert to DataFrame
+df = pd.DataFrame(lane_details)
+
+# Plotting
+plt.figure(figsize=(12, 6))
+lane_w = carriageway_width / 6
+cross_girder_spacing = list(range(0, int(bridge_span) + 1, int(cross_spacing)))
+
+# Draw lane rectangles
+for index, row in df.iterrows():
+    lane_num = int(row["Lane"].split()[-1]) - 1
+    x_start = lane_num * lane_w
+    plt.gca().add_patch(plt.Rectangle((x_start + 0.5, 1), lane_w - 1, 2,
+                     edgecolor='blue', facecolor='lightblue'))
+    plt.text(x_start + lane_w / 2, 2, row["Vehicle Type"], ha='center', va='center')
+
+# Draw cross girder lines and labels
+for y in cross_girder_spacing:
+    plt.axhline(y=y, color='gray', linestyle='--', linewidth=0.8)
+    plt.text(-0.5, y, f"{y}m", va='center', ha='right', fontsize=8)
+
+plt.xlim(0, lane_w * 6)
+plt.ylim(0, max(cross_girder_spacing) + 2)
+plt.xticks([i * lane_w for i in range(7)])
+plt.yticks(cross_girder_spacing)
+plt.title("Vehicle Placement for " + selected_case + " (" + substitute_vehicle + ")")
+plt.xlabel("Lane Position")
+plt.ylabel("Cross Girder Spacing (m)")
+plt.grid(True)
+plt.tight_layout()
+plt.show()
+
+display(vehicle_lanes_df)

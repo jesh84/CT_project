@@ -1,54 +1,31 @@
-# 📄 Design Analysis – TeeBridge
+# Tee Bridge
 
-## What Is It?
+This is a simple Python program that connects two data streams — like input and output — and lets you send and receive messages through them. It can be used for connecting things like serial ports, network sockets, or other types of communication interfaces.
 
-`TeeBridge` is a Python class that lets you send printed output to two places at once:
-1. The screen (like normal)
-2. A file (to save what was printed)
+## What It Does
 
-It works like the `tee` command in Linux.
+The script sets up a **tee bridge**, which:
+- Reads data from one input.
+- Sends it to multiple outputs (like a tee pipe in plumbing).
+- Also works in the opposite direction if needed.
 
----
+This can be useful for logging, debugging, or controlling devices.
 
-## How Does It Work?
+## Features
 
-- You create a `TeeBridge` object and pass in:
-  - The original output stream (`sys.stdout` or `sys.stderr`)
-  - A file or any other writable stream
+- Handles input and output in real time.
+- Works with threads to keep everything running smoothly.
+- Can stop safely using signals like Ctrl+C.
 
-- Then, you replace `sys.stdout` with your `TeeBridge` object.
-- After that, everything you `print()` goes to both the screen and the file.
+## Requirements
 
----
+- Python 3.x
 
-## What’s In the Code?
+You don't need to install any extra libraries — it only uses built-in Python modules.
 
-### `__init__(self, original_stream, additional_stream)`
-- Sets up the two places where the output should go.
+## How to Use
 
-### `write(self, data)`
-- Sends the printed data to both the screen and the file.
+Run the script with:
 
-### `flush(self)`
-- Makes sure everything gets written out right away.
-
-### `close(self)`
-- Closes the file (does not close the screen output).
-
----
-
-## Why It’s Useful
-
-- Lets you see output in the terminal and save it at the same time.
-- Great for CTFs, hacking scripts, or debugging tools.
-- Very lightweight — no extra packages needed.
-
----
-
-## Limitations
-
-- Not made for multi-threaded use.
-- You must manually reset `sys.stdout` when you're done.
-- Doesn’t support `with` statements (but could be improved to do that).
-
----
+```bash
+python tee_bridge.py

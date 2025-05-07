@@ -28,4 +28,4 @@ You don't need to install any extra libraries — it only uses built-in Python m
 Run the script with:
 
 ```bash
-python tee_bridge.py
+python main.py

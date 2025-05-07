@@ -1,0 +1,998 @@
+import pandas as pd
+import numpy as np
+from scipy.interpolate import RegularGridInterpolator
+import math
+import openpyxl
+from openpyxl.utils.dataframe import dataframe_to_rows
+import matplotlib.pyplot as plt
+import matplotlib.patches as patches
+
+class IRCBridgeDesign:
+    def __init__(self, file_path):
+        self.load_standards()
+        self.load_inputs(file_path)
+        self.validate_inputs()
+        self.prepare_vehicle_data()
+
+    def load_standards(self):
+        """Load IRC design standards and parameters"""
+        self.IRC6 = {
+            'impact_factor': {
+                'tracked': 1.10,
+                'wheeled': 1.25,
+                'default': 1.0
+            },
+            'load_combinations': {
+                'ULS': {'DL': 1.35, 'LL': 1.5},
+                'SLS': {'DL': 1.0, 'LL': 1.0}
+            },
+            'vehicle_offset': 1.2
+        }
+
+        self.IRC21 = {
+            'min_slab_thickness': lambda L: max(L / 15, 0.18),
+            'effective_width': {
+                'slab': lambda u, t: u + 2 * t,
+                'girder': lambda L, b: min(L / 4, 12 * 0.2 + b)
+            },
+            'concrete_properties': {
+                'M25': {'fck': 25, 'fctm': 2.6, 'Ecm': 31000}
+            },
+            'steel_properties': {
+                'Fe415': {'fy': 415, 'Es': 2e5}
+            }
+        }
+
+    def load_inputs(self, file_path):
+        """Load input parameters from Excel file"""
+        try:
+            self.inputs = pd.read_excel(file_path, sheet_name="Inputs")
+            self.load_cases = pd.read_excel(file_path, sheet_name="Live load")
+            self.raw_vehicles = pd.read_excel(file_path, sheet_name="Vehicle Loads")
+
+            self.params = {}
+            for _, row in self.inputs.iterrows():
+                key = str(row["Parameter Name"]).strip().lower()
+                val = row["Value"]
+                if isinstance(val, (int, float)):
+                    self.params[key] = float(val)
+                elif isinstance(val, str):
+                    self.params[key] = val.strip()
+                else:
+                    self.params[key] = val
+
+        except Exception as e:
+            raise ValueError(f"Error loading input file: {str(e)}")
+
+    def validate_inputs(self):
+        """Validate required input parameters"""
+        required = [
+            'bridge span', 'no. of lanes', 'carriageway width',
+            'no. of girders', 'slab thickness', 'tee beam depth',
+            'tee beam width', 'tee beam spacing', 'cross girder spacing'
+        ]
+
+        missing = [key for key in required if key not in self.params]
+        if missing:
+            raise ValueError(f"Missing required parameters: {', '.join(missing)}")
+
+        for key in ['bridge span', 'slab thickness', 'tee beam depth']:
+            if self.params[key] <= 0:
+                raise ValueError(f"{key} must be a positive value")
+
+        min_thickness = self.IRC21['min_slab_thickness'](self.params['cross girder spacing'])
+        if self.params['slab thickness'] < min_thickness:
+            print(f"Warning: Slab thickness {self.params['slab thickness']} m is less than IRC minimum {min_thickness} m")
+
+    def prepare_vehicle_data(self):
+        """Prepare vehicle load data for analysis"""
+        selected_case = self.params.get('load case')
+        case_data = self.load_cases[self.load_cases['Case Name'] == selected_case]
+        
+        if case_data.empty:
+            raise ValueError(f"Load case '{selected_case}' not found in Excel sheet")
+
+        lane_vehicles = []
+        for lane_num in range(1, int(self.params['no. of lanes']) + 1):
+            lane_col = f"Lane {lane_num}"
+            vehicle_type = str(case_data.iloc[0][lane_col]).strip()
+            if vehicle_type.lower() != 'empty':
+                lane_vehicles.append((vehicle_type, lane_num))
+
+        vehicle_data = []
+        for vehicle_type, lane_num in lane_vehicles:
+            vehicle_row = self.raw_vehicles[self.raw_vehicles['Vehicle Type'] == vehicle_type]
+            if vehicle_row.empty:
+                raise ValueError(f"Vehicle type '{vehicle_type}' not found in Vehicle Loads sheet")
+
+            vehicle = vehicle_row.iloc[0].to_dict()
+            vehicle['lane_num'] = lane_num
+            vehicle['offset'] = self.params.get('vehicle_offset', 1.2)
+            vehicle_data.append(vehicle)
+
+        self.vehicles = pd.DataFrame(vehicle_data)
+
+    def _calculate_vehicle_cg(self, axle_loads, axle_spacings):
+        """Calculate vehicle center of gravity"""
+        axle_positions = np.cumsum([0] + axle_spacings)
+        total_load = sum(axle_loads)
+        if total_load == 0:
+            return 0
+        return sum(w * d for w, d in zip(axle_loads, axle_positions)) / total_load
+
+    def _calculate_courbon_reactions(self, total_load, e, dx, sum_I_dx2, no_girders):
+        """Calculate girder reactions using Courbon's method"""
+        if sum_I_dx2 == 0:
+            return np.full(no_girders, total_load / no_girders)
+        return (total_load / no_girders) * (1 + (no_girders * e * dx) / (2 * sum_I_dx2))
+
+    def get_pigeaud_coeffs(self, uB_ratio, vL_ratio, K):
+        """Get Pigeaud coefficients through interpolation"""
+        m1_data = np.array([
+            [0.045, 0.043, 0.040, 0.037, 0.034],
+            [0.063, 0.060, 0.056, 0.052, 0.048],
+            [0.078, 0.074, 0.069, 0.064, 0.059],
+            [0.091, 0.086, 0.080, 0.074, 0.068],
+            [0.102, 0.097, 0.090, 0.083, 0.076]
+        ])
+        uB_points = np.linspace(0.1, 0.5, 5)
+        vL_points = np.linspace(0.1, 0.5, 5)
+        interp = RegularGridInterpolator((uB_points, vL_points), m1_data, bounds_error=False)
+
+        uB_ratio = np.clip(float(uB_ratio), 0.1, 0.5)  # Convert to float explicitly
+        vL_ratio = np.clip(float(vL_ratio), 0.1, 0.5)  # Convert to float explicitly
+
+        m1 = interp(np.array([uB_ratio, vL_ratio]))[0]  # Extract scalar value
+        m2 = m1 * (0.3 - 0.05 * K)
+        return m1, m2
+
+    def design_slab_panel(self):
+        """Design the deck slab panel"""
+        B = self.params['tee beam spacing']
+        L = self.params['cross girder spacing']
+
+        # Dead load calculation
+        DL_slab = self.params['slab thickness'] * 24
+        DL_wc = self.params['wearing coat thickness'] * 22
+        total_DL = DL_slab + DL_wc
+        W_DL = total_DL * B * L
+
+        # Live load from critical vehicle
+        critical_vehicle = self.vehicles.iloc[0].to_dict()
+        W_LL = critical_vehicle['Axle Load 1 (kN)']
+
+        # Effective loaded area
+        u_eff = critical_vehicle['Load Area Width (m)'] + 2 * self.params['wearing coat thickness']
+        v_eff = critical_vehicle['Load Area Length (m)'] + 2 * self.params['wearing coat thickness']
+
+        # Pigeaud coefficients
+        m1_DL, m2_DL = 0.05, 0.015
+        m1_LL, m2_LL = self.get_pigeaud_coeffs(u_eff / B, v_eff / L, B / L)
+
+        # Bending moments
+        MB_DL = W_DL * (m1_DL + 0.15 * m2_DL)
+        ML_DL = W_DL * (m2_DL + 0.15 * m1_DL)
+
+        # Impact factor
+        vehicle_type = critical_vehicle['Vehicle Type'].lower()
+        impact = self.IRC6['impact_factor']['tracked' if 'tracked' in vehicle_type else 'wheeled']
+
+        MB_LL = W_LL * (m1_LL + 0.15 * m2_LL) * impact
+        ML_LL = W_LL * (m2_LL + 0.15 * m1_LL) * impact
+
+        # Load factors
+        factors = self.IRC6['load_combinations']['ULS']
+        MB_design = MB_DL * factors['DL'] + MB_LL * factors['LL']
+        ML_design = ML_DL * factors['DL'] + ML_LL * factors['LL']
+
+        # Shear force
+        SF_DL = W_DL / 2
+        SF_LL = W_LL * impact / 2
+        SF_design = SF_DL * factors['DL'] + SF_LL * factors['LL']
+
+        return {
+            'moments': {
+                'DL': {'MB': MB_DL, 'ML': ML_DL},
+                'LL': {'MB': MB_LL, 'ML': ML_LL},
+                'design': {'MB': MB_design, 'ML': ML_design}
+            },
+            'shear': {
+                'DL': SF_DL,
+                'LL': SF_LL,
+                'design': SF_design
+            },
+            'panel_dimensions': {'B': B, 'L': L},
+            'vehicle_used': critical_vehicle['Vehicle Type']
+        }
+
+    def design_longitudinal_girders(self):
+        """Design longitudinal girders"""
+        span = self.params['bridge span']
+        no_girders = int(self.params.get('no. of girders', 8))
+        girder_spacing = self.params['tee beam spacing']
+        carriageway_width = self.params['carriageway width']
+
+        # Courbon's method setup
+        centerline = (no_girders - 1) * girder_spacing / 2
+        dx = np.array([i * girder_spacing - centerline for i in range(no_girders)])
+        sum_I_dx2 = np.sum(dx**2)
+
+        LL_BM = np.zeros(no_girders)
+        LL_SF = np.zeros(no_girders)
+
+        for _, vehicle in self.vehicles.iterrows():
+            axle_cols = [col for col in vehicle.index if 'Axle Load' in col and '(kN)' in col]
+            axle_loads = [vehicle[col] for col in axle_cols if pd.notna(vehicle[col]) and vehicle[col] > 0]
+            axle_spacings = [float(x.strip()) for x in str(vehicle['Axle Spacing (m)']).split(',') if x.strip()]
+            axle_spacings = axle_spacings[:len(axle_loads)-1]
+            axle_positions = np.cumsum([0] + axle_spacings)
+
+            vehicle_reactions = np.zeros(no_girders)
+            vehicle_bm = np.zeros(no_girders)
+
+            for axle_load, axle_pos in zip(axle_loads, axle_positions):
+                lane_width = carriageway_width / no_girders
+                lane_pos = (vehicle['lane_num'] - 0.5) * lane_width
+                bridge_pos = lane_pos + vehicle['offset'] + axle_pos
+                e = bridge_pos - centerline
+
+                reactions = self._calculate_courbon_reactions(axle_load, e, dx, sum_I_dx2, no_girders)
+                reactions = np.maximum(reactions, 0)
+                vehicle_reactions += reactions
+
+                for i in range(no_girders):
+                    x = axle_pos
+                    if 0 <= x <= span:
+                        bm = (axle_load * x * (span - x)) / span
+                        vehicle_bm[i] += bm * (reactions[i] / axle_load)
+
+            vehicle_type = vehicle['Vehicle Type'].lower()
+            impact = self.IRC6['impact_factor']['tracked' if 'tracked' in vehicle_type else 'wheeled']
+
+            LL_BM = np.maximum(LL_BM, vehicle_bm * impact)
+            LL_SF = np.maximum(LL_SF, vehicle_reactions * impact)
+
+        # Dead load calculations
+        girder_sw = self.params['tee beam width'] * self.params['tee beam depth'] * 25
+
+        slab_loads = {
+            'wearing_course': self.params['wearing coat thickness'] * 22 * girder_spacing,
+            'kerb': self.params.get('kerb_area', 0.15) * 24 * 2 / no_girders,
+            'deck_slab': self.params['slab thickness'] * 24 * girder_spacing
+        }
+
+        cross_girder_load = 0
+        if 'cross girder depth' in self.params:
+            cross_g_area = self.params['cross girder width'] * self.params['cross girder depth']
+            cross_girder_load = (cross_g_area * 25 * self.params['cross girder spacing']) / span
+
+        total_DL_per_girder = girder_sw + sum(slab_loads.values()) + cross_girder_load
+        DL_BM = total_DL_per_girder * span**2 / 8
+        DL_SF = total_DL_per_girder * span / 2
+
+        # Load factors
+        factors = self.IRC6['load_combinations']['ULS']
+        design_BM = DL_BM * factors['DL'] + LL_BM * factors['LL']
+        design_SF = DL_SF * factors['DL'] + LL_SF * factors['LL']
+
+        return {
+            'girder_properties': {
+                'span': span,
+                'spacing': girder_spacing,
+                'depth': self.params['tee beam depth'],
+                'width': self.params['tee beam width'],
+                'count': no_girders
+            },
+            'dead_loads': {
+                'self_weight': girder_sw,
+                'slab_components': slab_loads,
+                'cross_girder': cross_girder_load,
+                'total_per_girder': total_DL_per_girder
+            },
+            'DL': {
+                'BM': DL_BM,
+                'SF': DL_SF
+            },
+            'LL': {
+                'BM': LL_BM,
+                'SF': LL_SF
+            },
+            'design': {
+                'BM': design_BM,
+                'SF': design_SF
+            },
+            'vehicles_considered': [v['Vehicle Type'] for _, v in self.vehicles.iterrows()]
+        }
+
+    def analyze_cross_girders(self):
+        """Analyze cross girders"""
+        span = self.params['tee beam spacing']
+        depth = self.params['cross girder depth']
+        width = self.params['cross girder width']
+        density = self.params.get('density of concrete', 25)
+        slab_thickness = self.params['slab thickness']
+        wearing_thickness = self.params['wearing coat thickness']
+
+        # Dead load components
+        self_weight = width * depth * density
+        slab_load = slab_thickness * density * span
+        wearing_load = wearing_thickness * 22 * span
+        total_dl = self_weight + slab_load + wearing_load
+
+        max_ll_bm = 0
+        max_ll_sf = 0
+
+        for _, vehicle in self.vehicles.iterrows():
+            axle_loads = [vehicle[f'Axle Load {i} (kN)'] for i in range(1, 5)
+                          if vehicle.get(f'Axle Load {i} (kN)', 0) > 0]
+
+            axle_spacings = [float(x.strip()) for x in str(vehicle['Axle Spacing (m)']).split(',') if x.strip()]
+            axle_spacings = axle_spacings[:len(axle_loads)-1]
+            axle_positions = np.cumsum([0] + axle_spacings)
+
+            vehicle_type = vehicle['Vehicle Type'].lower()
+            impact = self.IRC6['impact_factor']['tracked' if 'tracked' in vehicle_type else 'wheeled']
+
+            for j, load in enumerate(axle_loads):
+                axle_x = axle_positions[j]
+                a = axle_x
+                b = span - axle_x
+                if 0 <= a <= span and 0 <= b <= span:
+                    bm = (load * a * b / span) * impact
+                    sf = (load * impact) / 2
+                    max_ll_bm = max(max_ll_bm, bm)
+                    max_ll_sf = max(max_ll_sf, sf)
+
+        dl_bm = total_dl * span**2 / 8
+        dl_sf = total_dl * span / 2
+        dl_reaction = total_dl * span / 2
+
+        ll_bm = max_ll_bm * 3
+        ll_sf = max_ll_sf * 2
+        ll_reaction = max_ll_sf
+
+        factors = self.IRC6['load_combinations']['ULS']
+        design_bm = dl_bm * factors['DL'] + ll_bm * factors['LL']
+        design_sf = dl_sf * factors['DL'] + ll_sf * factors['LL']
+
+        return {
+            'properties': {
+                'span': span,
+                'depth': depth,
+                'width': width,
+                'cross_girder_spacing': self.params['cross girder spacing']
+            },
+            'dead_loads': {
+                'self_weight': self_weight,
+                'slab_load': slab_load,
+                'wearing_load': wearing_load,
+                'total_dl': total_dl
+            },
+            'reactions': {
+                'dl_per_support': dl_reaction,
+                'll_per_support': ll_reaction,
+                'total_per_support': dl_reaction + ll_reaction
+            },
+            'DL': {
+                'BM': dl_bm,
+                'SF': dl_sf
+            },
+            'LL': {
+                'BM': ll_bm,
+                'SF': ll_sf
+            },
+            'design': {
+                'BM': design_bm,
+                'SF': design_sf
+            },
+            'vehicles_considered': [v['Vehicle Type'] for _, v in self.vehicles.iterrows()]
+        }
+
+    def design_slab_reinforcement(self, slab_results):
+        """Design slab reinforcement"""
+        fck = self.IRC21['concrete_properties']['M25']['fck']
+        fy = self.IRC21['steel_properties']['Fe415']['fy']
+        b = 1000
+        d = self.params['slab thickness'] * 1000 - 40
+        Mu = max(slab_results['moments']['design']['MB'], slab_results['moments']['design']['ML']) * 1e6
+
+        # Flexural design
+        R = Mu / (b * d**2)
+        ratio = (fck / (2 * fy)) * (1 - ((1 - (4.598 * R / fck))**0.5))
+        Ast = ratio * b * d
+
+        bar_dia_long = 16
+        bar_dia_trans = 10
+        area_bar_long = 3.1416 * (bar_dia_long ** 2) / 4
+        area_bar_trans = 3.1416 * (bar_dia_trans ** 2) / 4
+
+        spacing_long = min((area_bar_long * 1000) / Ast, 150)
+        spacing_trans = min((area_bar_trans * 1000) / Ast, 250)
+
+        # Shear check
+        rho = Ast / (b * d)
+        rho = min(rho, 0.02)
+        K = min(1 + (200 / d)**0.5, 2.0)
+        vmin = 0.031 * (K**1.5) * (fck**0.5)
+        sigma_cp = 0
+        vrd_nominal = (0.12 * K * (80 * rho * fck)**0.33 + 0.15 * sigma_cp)
+        vrd_min = vmin + 0.15 * sigma_cp
+        vrdc = max(vrd_nominal, vrd_min)
+        Vrdc = vrdc * b * d / 1000
+
+        # Cracking check
+        sigma_cb = 0.48 * fck
+        sigma_s = 0.8 * fy
+        M_service = 0.6 * Mu
+        xu = (Ast * sigma_s) / (sigma_cb * b)
+        sigma_s_actual = M_service / ((d - xu / 3) * Ast)
+        cracking_check = sigma_s_actual <= sigma_s
+
+        # Deflection check
+        phi_creep = 2
+        Ecm = 5000 * (fck ** 0.5)
+        Eceff = Ecm / (1 + phi_creep)
+        DL_kN_per_m2 = self.params['slab thickness'] * 24 + self.params['wearing coat thickness'] * 22
+        w = DL_kN_per_m2 * 0.001
+        L = slab_results['panel_dimensions']['L'] * 1000
+        I = b * self.params['slab thickness']**3 / 12
+        delta_live = (5 * w/2 * L**4) / (384 * Eceff * 1e6 * I)
+        delta_total = phi_creep * delta_live
+        deflection_check = (delta_live < L / 800) and (delta_total < L / 250)
+
+        return {
+            'concrete_grade': 'M25',
+            'steel_grade': 'Fe415',
+            'Mu_design_kNm': Mu / 1e6,
+            'Ast_req_mm2': Ast,
+            'bar_dia_long_mm': bar_dia_long,
+            'bar_dia_trans_mm': bar_dia_trans,
+            'spacing_long_mm': spacing_long,
+            'spacing_trans_mm': spacing_trans,
+            'top_reinf': f"Top: 16 mm @ {spacing_long:.0f} mm c/c (longitudinal), 10 mm @ {spacing_trans:.0f} mm c/c (transverse)",
+            'bottom_reinf': f"Bottom: 16 mm @ {spacing_long:.0f} mm c/c (longitudinal), 10 mm @ {spacing_trans:.0f} mm c/c (transverse)",
+            'rho': rho,
+            'vrdc_kN': Vrdc,
+            'sigma_s_actual': sigma_s_actual,
+            'sigma_s_limit': sigma_s,
+            'cracking_check': cracking_check,
+            'Ecm': Ecm,
+            'Eceff': Eceff,
+            'delta_live_mm': delta_live,
+            'delta_total_mm': delta_total,
+            'deflection_check': deflection_check
+        }
+
+    def design_longitudinal_girder_flexure(self, Mu, d, bf, Df, fck=25, fy=415):
+        """Design flexural reinforcement for longitudinal girder"""
+        Mu *= 1e6
+        xu = (Mu / (0.36 * fck * bf * d)) * (1 / (1 - 0.42))
+        
+        val = 1 - ((4.6 * Mu) / (fck * bf * d**2))
+        val = max(val, 0)
+        Ast = (0.5 * fck / fy) * (1 - math.sqrt(val)) * bf * d
+
+        bar_dia = 25
+        bar_area = 3.1416 * bar_dia**2 / 4
+        bars_required = int(Ast / bar_area) + 1
+        
+        return {
+            'xu_mm': xu,
+            'Ast_mm2': Ast,
+            'bar_dia_mm': bar_dia,
+            'bars_required': bars_required,
+            'arrangement': f"Provide {bars_required} nos. {bar_dia}mm dia bars"
+        }
+
+    def design_longitudinal_girder_shear(self, Vu, d, bw, fck=25, fy=415):
+        """Design shear reinforcement for longitudinal girder"""
+        Vu_N = Vu * 1e3
+        d_mm = d
+        b_mm = bw
+
+        K = min(1 + (200 / d_mm)**0.5, 2.0)
+        vmin = 0.031 * K**1.5 * fck**0.5
+        Vrdc_N = vmin * b_mm * d_mm
+
+        if Vu_N <= Vrdc_N:
+            return {
+                'shear_safe': True,
+                'Vrdc_kN': Vrdc_N / 1e3,
+                'message': "No shear reinforcement required"
+            }
+
+        Vd = Vu_N - Vrdc_N
+        bar_dia = 10
+        legs = 4
+        Asv = legs * (3.1416 * bar_dia**2 / 4)
+        Sv = min((0.87 * fy * Asv * d_mm) / Vd, 300)
+
+        return {
+            'shear_safe': False,
+            'Vrdc_kN': Vrdc_N / 1e3,
+            'Vu_kN': Vu,
+            'Vd_kN': Vd / 1e3,
+            'bar_dia_mm': bar_dia,
+            'legs': legs,
+            'Sv_mm': int(Sv),
+            'arrangement': f"Provide {legs}-legged {bar_dia}mm dia stirrups @ {int(Sv)}mm c/c"
+        }
+
+    def tee_beam(self):
+        """Design T-beam girders"""
+        analysis = self.design_longitudinal_girders()
+        results = []
+
+        bf = self.params['tee beam spacing'] * 1000
+        Df = self.params.get('slab thickness', 0.2) * 1000
+        d = self.params['tee beam depth'] * 1000
+        bw = self.params['tee beam width'] * 1000
+
+        for i in range(len(analysis['design']['BM'])):
+            Mu = analysis['design']['BM'][i]
+            Vu = analysis['design']['SF'][i]
+
+            flexure_result = self.design_longitudinal_girder_flexure(Mu, d, bf, Df)
+            shear_result = self.design_longitudinal_girder_shear(Vu, d, bw)
+
+            girder_data = {
+                'Girder': f"G{i+1}",
+                'Mu (kNm)': Mu,
+                'Vu (kN)': Vu,
+                'Flexure': flexure_result,
+                'Shear': shear_result
+            }
+            results.append(girder_data)
+
+        return results
+
+    def design_cross_girders(self):
+        """Design cross girders"""
+        analysis = self.analyze_cross_girders()
+        Mu = analysis['design']['BM']
+        Vu = analysis['design']['SF']
+
+        bf = self.params['cross girder spacing'] * 1000
+        Df = self.params.get('slab thickness', 0.2) * 1000
+        d = self.params['cross girder depth'] * 1000 - 100
+        bw = self.params['cross girder width'] * 1000
+
+        try:
+            flexure_result = self.design_longitudinal_girder_flexure(Mu, d, bf, Df)
+        except Exception as e:
+            flexure_result = {'error': f"Flexure design failed: {str(e)}"}
+
+        try:
+            shear_result = self.design_longitudinal_girder_shear(Vu, d, bw)
+        except Exception as e:
+            shear_result = {'error': f"Shear design failed: {str(e)}", 'safe': False}
+
+        return {
+            'Mu (kNm)': Mu,
+            'Vu (kN)': Vu,
+            'Flexure': flexure_result,
+            'Shear': shear_result
+        }
+
+
+   
+    def print_design_summary(self):
+        """Generate formatted design report"""
+        try:
+            slab = self.design_slab_panel()
+            slab_reinf = self.design_slab_reinforcement(slab)
+            girder = self.design_longitudinal_girders()
+            girder_reinf = self.tee_beam()
+            cross = self.analyze_cross_girders()
+            cross_reinf = self.design_cross_girders()
+
+            print("\n" + "="*100)
+            print("IRC-COMPLIANT T-BEAM BRIDGE DESIGN SUMMARY")
+            print("="*100)
+
+            # Slab Design Results
+            print("\nDECK SLAB DESIGN (IRC:21-2000)")
+            print("-"*80)
+            print(f"Panel Dimensions: {slab['panel_dimensions']['B']}m (short span) x {slab['panel_dimensions']['L']}m (long span)")
+            
+            print("\nBending Moments (kNm):")
+            print(f"{'Load Case':<15} {'Short Span (MB)':<20} {'Long Span (ML)':<20}")
+            print(f"{'Dead Load':<15} {slab['moments']['DL']['MB']:<20.2f} {slab['moments']['DL']['ML']:<20.2f}")
+            print(f"{'Live Load':<15} {slab['moments']['LL']['MB']:<20.2f} {slab['moments']['LL']['ML']:<20.2f}")
+            print(f"{'Factored (ULS)':<15} {slab['moments']['design']['MB']:<20.2f} {slab['moments']['design']['ML']:<20.2f}")
+
+            print("\nShear Force (kN):")
+            print(f"{'Dead Load':<15} {slab['shear']['DL']:.2f}")
+            print(f"{'Live Load':<15} {slab['shear']['LL']:.2f}")
+            print(f"{'Factored (ULS)':<15} {slab['shear']['design']:.2f}")
+
+            print("\nReinforcement:")
+            print(f"Top    : {slab_reinf['top_reinf']}")
+            print(f"Bottom : {slab_reinf['bottom_reinf']}")
+            print("\nServiceability Checks:")
+            print(f"{'Crack Check Passed':<25}: {slab_reinf['cracking_check']}")
+            print(f"{'Live Load Deflection (mm)':<25}: {slab_reinf['delta_live_mm']:.2f}")
+            print(f"{'Total Deflection (mm)':<25}: {slab_reinf['delta_total_mm']:.2f}")
+            print(f"{'Deflection Check Passed':<25}: {slab_reinf['deflection_check']}")
+
+            # Girder Design Results
+            print("\n\nLONGITUDINAL GIRDERS (IRC:6-2017 & IRC:112-2020)")
+            print("-"*80)
+            
+            for g in girder_reinf:
+                print(f"\n{g['Girder']} | Mu = {g['Mu (kNm)']:.1f} kNm  Vu = {g['Vu (kN)']:.1f} kN")
+                print(f"  xu         : {g['Flexure']['xu_mm']:.1f} mm")
+                print(f"  Ast req    : {g['Flexure']['Ast_mm2']:.1f} mm²")
+                print(f"  Bar dia    : {g['Flexure']['bar_dia_mm']} mm")
+                print(f"  Bars req   : {g['Flexure']['bars_required']}")
+
+                if g['Shear']['shear_safe']:
+                    print("  Shear      : OK (Concrete alone is adequate)")
+                else:
+                    print(f"  Shear      : {g['Shear']['arrangement']}")
+            
+            print(f"\nSpan: {girder['girder_properties']['span']}m | Spacing: {girder['girder_properties']['spacing']}m")
+            print(f"Section: {girder['girder_properties']['width']}m x {girder['girder_properties']['depth']}m")
+
+            # Cross Girder Results
+            print("\n\nCROSS GIRDERS ANALYSIS")
+            print("-"*80)
+            print(f"Span: {cross['properties']['span']}m | Spacing: {cross['properties']['cross_girder_spacing']}m")
+            print(f"Section: {cross['properties']['width']}m x {cross['properties']['depth']}m")
+
+            print("\nDead Loads (kN/m):")
+            print(f"Self-weight    : {cross['dead_loads']['self_weight']:.2f}")
+            print(f"Slab load      : {cross['dead_loads']['slab_load']:.2f}")
+            print(f"Wearing course : {cross['dead_loads']['wearing_load']:.2f}")
+            print(f"Total          : {cross['dead_loads']['total_dl']:.2f}")
+
+            print("\nMaximum Forces:")
+            print(f"{'Load Case':<15} {'Bending Moment (kNm)':<20} {'Shear Force (kN)':<20}")
+            print(f"{'Dead Load':<15} {cross['DL']['BM']:<20.2f} {cross['DL']['SF']:<20.2f}")
+            print(f"{'Live Load':<15} {cross['LL']['BM']:<20.2f} {cross['LL']['SF']:<20.2f}")
+            print(f"{'Factored (ULS)':<15} {cross['design']['BM']:<20.2f} {cross['design']['SF']:<20.2f}")
+
+            print("\nReinforcement:")
+            if cross_reinf.get('Flexure') and 'arrangement' in cross_reinf['Flexure']:
+                print("Flexure :", cross_reinf['Flexure']['arrangement'])
+            else:
+                print("Flexure : provide minimum")
+
+            if cross_reinf.get('Shear'):
+                if cross_reinf['Shear'].get('shear_safe'):
+                    print("Shear   : OK (Concrete alone is adequate)")
+                else:
+                    print("Shear   :", cross_reinf['Shear'].get('arrangement', 'Design failed'))
+            else:
+                print("Shear   : Provide minimum")
+
+        except Exception as e:
+            print(f"\nError generating design summary: {str(e)}")
+
+    def export_design_results_to_excel(self, input_path="Tee_beam.xlsx", output_path="Tee_beam.xlsx"):
+        """Export design results to Excel"""
+        try:
+            slab = self.design_slab_panel()
+            slab_reinf = self.design_slab_reinforcement(slab)
+            girder = self.design_longitudinal_girders()
+            girder_reinf = self.tee_beam()
+            cross = self.analyze_cross_girders()
+            cross_reinf = self.design_cross_girders()
+
+            try:
+                wb = openpyxl.load_workbook(input_path)
+            except FileNotFoundError:
+                wb = openpyxl.Workbook()
+                wb.remove(wb.active)
+
+            if "Result" in wb.sheetnames:
+                wb.remove(wb["Result"])
+            ws = wb.create_sheet("Result")
+
+            # Write slab design results
+            ws.append(["SLAB DESIGN RESULTS"])
+            ws.append(["Parameter", "Value"])
+            ws.append(["Short Span BM (ULS, kNm)", slab['moments']['design']['MB']])
+            ws.append(["Long Span BM (ULS, kNm)", slab['moments']['design']['ML']])
+            ws.append(["Shear Force (ULS, kN)", slab['shear']['design']])
+            ws.append(["Top Reinforcement", slab_reinf['top_reinf']])
+            ws.append(["Bottom Reinforcement", slab_reinf['bottom_reinf']])
+            ws.append([])
+
+            # Write girder design results
+            ws.append(["LONGITUDINAL GIRDER DESIGN"])
+            headers = ["Girder", "Mu (kNm)", "Vu (kN)", "Ast (mm2)", "Bars", "Shear Reinforcement"]
+            ws.append(headers)
+            
+            for g in girder_reinf:
+                shear_design = g['Shear']['arrangement'] if not g['Shear']['shear_safe'] else "OK"
+                row = [
+                    g['Girder'],
+                    g['Mu (kNm)'],
+                    g['Vu (kN)'],
+                    f"{g['Flexure']['Ast_mm2']:.1f}",
+                    f"{g['Flexure']['bars_required']} nos. {g['Flexure']['bar_dia_mm']}mm",
+                    shear_design
+                ]
+                ws.append(row)
+            
+            ws.append([])
+            
+            # Write cross girder results
+            ws.append(["CROSS GIRDER DESIGN"])
+            ws.append(["Bending Moment (kNm)", cross['design']['BM']])
+            ws.append(["Shear Force (kN)", cross['design']['SF']])
+            
+            flexure_reinf = cross_reinf.get('Flexure', {}).get('arrangement', 'Provide minimum')
+            shear_reinf = cross_reinf.get('Shear', {}).get('arrangement', 'OK' if cross_reinf.get('Shear', {}).get('shear_safe') else 'Design failed')
+            
+            ws.append(["Flexure Reinforcement", flexure_reinf])
+            ws.append(["Shear Reinforcement", shear_reinf])
+
+            wb.save(output_path)
+            print(f"\nDesign results successfully exported to '{output_path}'")
+
+        except Exception as e:
+            print(f"\nError exporting to Excel: {str(e)}")
+            raise
+
+    def plot_vehicle_lanes(self):
+        """Plot vehicle lane positions and cross girder spacing"""
+        try:
+            carriageway_width = float(self.params.get('carriageway width', 21))
+            bridge_span = float(self.params.get('bridge span', 16))
+            cross_spacing = float(self.params.get('cross girder spacing', 5))
+
+            # Validate parameters
+            if np.isnan(bridge_span) or np.isnan(cross_spacing):
+                raise ValueError("Bridge span or cross girder spacing is missing or invalid.")
+
+            selected_case = self.params.get('load case', '').title()
+            substitute_vehicle = self.params.get('type of vehicle', '').title()
+
+            plt.figure(figsize=(12, 6))
+            lane_w = carriageway_width / 6
+            cross_girder_spacing = list(range(0, int(bridge_span) + 1, int(cross_spacing)))
+
+            for index, row in self.vehicles.iterrows():
+                lane_num = row['lane_num'] - 1
+                x_start = lane_num * lane_w
+                plt.gca().add_patch(plt.Rectangle((x_start + 0.5, 1), lane_w - 1, 2,
+                                 edgecolor='blue', facecolor='lightblue'))
+                plt.text(x_start + lane_w / 2, 2, row["Vehicle Type"], 
+                        ha='center', va='center')
+
+            for y in cross_girder_spacing:
+                plt.axhline(y=y, color='gray', linestyle='--', linewidth=0.8)
+                plt.text(-0.5, y, f"{y}m", va='center', ha='right', fontsize=8)
+
+            plt.xlim(0, lane_w * 6)
+            plt.ylim(0, max(cross_girder_spacing) + 2)
+            plt.xticks([i * lane_w for i in range(7)])
+            plt.yticks(cross_girder_spacing)
+            plt.title(f"Vehicle Placement for {selected_case} ({substitute_vehicle})")
+            plt.xlabel("Lane Position")
+            plt.ylabel("Cross Girder Spacing (m)")
+            plt.grid(True)
+            plt.tight_layout()
+            plt.show()
+
+        except Exception as e:
+            print(f"\nError generating lane plot: {str(e)}")
+
+    def plot_bridge_cross_section(self):
+        """Plot realistic, annotated bridge cross section (no piers) using Excel inputs"""
+        try:
+            # Read dimensions from Excel (m → mm)
+            cw = float(self.params['carriageway width']) * 1000
+            ng = int(self.params['no. of girders'])
+            gw = float(self.params['tee beam width']) * 1000
+            gd = float(self.params['tee beam depth']) * 1000
+            st = float(self.params['slab thickness']) * 1000
+            kw = float(self.params['kerb width']) * 1000
+            kh = float(self.params['kerb height']) * 1000
+
+            base_y = 0
+            total_width = cw + 2 * kw
+
+            fig, ax = plt.subplots(figsize=(14, 6))
+
+            # Deck slab
+            ax.add_patch(patches.Rectangle((kw, base_y + gd), cw, st, facecolor='lightgray', edgecolor='black'))
+
+            # Kerbs (left and right)
+            ax.add_patch(patches.Rectangle((0, base_y + gd + st), kw, kh, facecolor='gray', edgecolor='black'))
+            ax.add_patch(patches.Rectangle((kw + cw, base_y + gd + st), kw, kh, facecolor='gray', edgecolor='black'))
+
+            ax.text(kw / 2, base_y + gd + st + kh / 2, f"Kerb {int(kh)} x {int(kw)}", fontsize=9, ha='center', va='center', rotation=90)
+
+            # Tee Beam Girders
+            girder_centers = np.linspace(kw + gw / 2, kw + cw - gw / 2, ng)
+            for x in girder_centers:
+                ax.add_patch(patches.Rectangle((x - gw / 2, base_y), gw, gd, facecolor='dimgray', edgecolor='black'))
+
+            # Labels
+            def draw_vertical_dim(x, y1, y2, label, offset=30):
+                ax.annotate('', xy=(x, y1), xytext=(x, y2), arrowprops=dict(arrowstyle='<->', color='red'))
+                ax.text(x + offset, (y1 + y2) / 2, label, rotation=90, va='center', ha='center', color='red', fontsize=9)
+
+            draw_vertical_dim(kw + cw + kw + 50, base_y, base_y + gd, f"{int(gd)}", offset=10)
+            draw_vertical_dim(kw + cw + kw + 100, base_y + gd, base_y + gd + st, f"{int(st)}", offset=10)
+            draw_vertical_dim(20, base_y + gd + st, base_y + gd + st + kh, f"{int(kh)}", offset=-15)
+
+            # Draw girder center labels
+            for x in girder_centers:
+                ax.plot([x, x], [base_y, base_y + gd], linestyle='--', color='black', linewidth=0.8)
+
+            # Carriageway dimension (bottom horizontal)
+            ax.annotate('', xy=(kw, base_y - 150), xytext=(kw + cw, base_y - 150), arrowprops=dict(arrowstyle='<->', color='red'))
+            ax.text(kw + cw / 2, base_y - 200, f"{int(cw)} mm carriageway", ha='center', fontsize=10, color='red')
+
+            # Final view
+            ax.set_xlim(-100, total_width + 200)
+            ax.set_ylim(-300, base_y + gd + st + kh + 300)
+            ax.axis('off')
+            ax.set_title(f"Bridge Cross Section\nGirders: {ng}, Spacing: approx {int(cw/(ng-1))} mm", fontsize=12)
+            plt.tight_layout()
+            plt.show()
+
+        except Exception as e:
+            print(f"Error plotting bridge cross-section: {str(e)}")
+
+    def plot_girder_reinforcement(self):
+        """Plot reinforcement layout for a typical T-beam girder section"""
+        try:
+            # Geometry from Excel (converted to mm)
+            bw = float(self.params['tee beam width']) * 1000
+            dw = float(self.params['tee beam depth']) * 1000
+            slab_thk = float(self.params['slab thickness']) * 1000
+            bf = float(self.params['carriageway width']) * 1000 / int(self.params['no. of girders'])  # flange width per girder
+
+            cover = 40  # mm
+            dia_main = 25  # mm (bottom bars)
+            dia_top = 16   # mm (top bars)
+            dia_stirrup = 10  # mm
+
+            fig, ax = plt.subplots(figsize=(8, 6))
+
+            # T-beam shape
+            total_h = dw + slab_thk
+            ax.add_patch(patches.Rectangle((0, 0), bw, dw, edgecolor='black', facecolor='#DDDDDD'))  # web
+            ax.add_patch(patches.Rectangle(((bw - bf) / 2, dw), bf, slab_thk, edgecolor='black', facecolor='#CCCCCC'))  # flange
+
+            # Bottom reinforcement (main bars)
+            spacing = (bw - 2 * cover - 3 * dia_main) / 2
+            for i in range(3):
+                x = cover + dia_main / 2 + i * spacing
+                ax.add_patch(plt.Circle((x, cover + dia_main / 2), dia_main / 2, color='red'))
+
+            # Top reinforcement in slab
+            for i in range(2):
+                x = (bw - bf) / 2 + cover + i * (bf - 2 * cover)
+                y = dw + slab_thk - cover - dia_top / 2
+                ax.add_patch(plt.Circle((x, y), dia_top / 2, color='blue'))
+
+            # Stirrups (just one shown)
+            stirrup_w = bw - 2 * cover
+            stirrup_h = dw - 2 * cover
+            ax.add_patch(patches.Rectangle((cover, cover), stirrup_w, stirrup_h,
+                                           edgecolor='black', facecolor='none', linestyle='--'))
+
+            # Labels
+            ax.text(10, total_h + 40, "Top bars (blue)", color='blue', fontsize=9)
+            ax.text(10, total_h + 20, "Bottom bars (red)", color='red', fontsize=9)
+            ax.text(10, total_h, "Stirrup (dashed)", color='black', fontsize=9)
+
+            # View settings
+            ax.set_xlim(-50, bf + 50)
+            ax.set_ylim(0, total_h + 100)
+            ax.set_aspect('equal')
+            ax.set_title("Typical T-Beam Girder Reinforcement")
+            ax.axis('off')
+            plt.tight_layout()
+            plt.show()
+
+        except Exception as e:
+            print(f"Error plotting reinforcement: {str(e)}")
+
+    def plot_reinforcement_layout(self):
+        """Plot reinforcement layout of a typical T-beam section using actual design data"""
+        try:
+            # Design outputs
+            slab = self.design_slab_panel()
+            slab_reinf = self.design_slab_reinforcement(slab)
+            girder = self.tee_beam()[0]  # Use first girder only
+            flex = girder['Flexure']
+            shear = girder['Shear']
+
+            # Geometric inputs
+            bf = float(self.params['tee beam spacing']) * 1000
+            Df = float(self.params['slab thickness']) * 1000
+            bw = float(self.params['tee beam width']) * 1000
+            d = float(self.params['tee beam depth']) * 1000
+            cover = 40  # mm
+
+            # Reinforcement values
+            bar_dia_bot = flex['bar_dia_mm']
+            num_bars = flex['bars_required']
+
+            stirrup_dia = shear.get('bar_dia_mm', 10)
+            stirrup_legs = shear.get('legs', 4)
+            stirrup_spacing = shear.get('Sv_mm', 200)
+
+            dia_top = slab_reinf['bar_dia_long_mm']
+            spacing_top = slab_reinf['spacing_long_mm']
+            dia_trans = slab_reinf['bar_dia_trans_mm']
+            spacing_trans = slab_reinf['spacing_trans_mm']
+
+            fig, ax = plt.subplots(figsize=(10, 6))
+            total_height = d + Df
+            total_width = bf
+
+            # 1. Draw T-beam
+            ax.add_patch(patches.Rectangle(((bf - bw) / 2, 0), bw, d, facecolor='#DDDDDD', edgecolor='black'))  # web
+            ax.add_patch(patches.Rectangle((0, d), bf, Df, facecolor='#CCCCCC', edgecolor='black'))  # flange
+
+            # 2. Bottom reinforcement bars (main)
+            x_start = (bf - bw) / 2 + cover + bar_dia_bot / 2
+            x_spacing = (bw - 2 * cover - bar_dia_bot) / (num_bars - 1) if num_bars > 1 else 0
+            y_bot = cover + bar_dia_bot / 2
+
+            for i in range(num_bars):
+                x = x_start + i * x_spacing
+                ax.add_patch(plt.Circle((x, y_bot), bar_dia_bot / 2, color='red'))
+
+            # 3. Stirrup (single visual)
+            ax.add_patch(patches.Rectangle(((bf - bw) / 2 + cover, cover),
+                                           bw - 2 * cover, d - 2 * cover,
+                                           facecolor='none', edgecolor='black', linestyle='--'))
+
+            # 4. Slab top reinforcement
+            x_top1 = cover + dia_top / 2
+            x_top2 = bf - cover - dia_top / 2
+            y_top = d + Df - cover - dia_top / 2
+            ax.add_patch(plt.Circle((x_top1, y_top), dia_top / 2, color='blue'))
+            ax.add_patch(plt.Circle((x_top2, y_top), dia_top / 2, color='blue'))
+
+            # 5. Slab bottom reinforcement
+            y_slab_bot = d + cover + dia_trans / 2
+            ax.add_patch(plt.Circle((x_top1, y_slab_bot), dia_trans / 2, color='blue'))
+            ax.add_patch(plt.Circle((x_top2, y_slab_bot), dia_trans / 2, color='blue'))
+
+            # 6. Annotations
+            ax.text(bf + 30, y_bot, f"{bar_dia_bot}Φ x {num_bars}", va='center', color='red')
+            ax.text(bf + 30, y_top, f"{dia_top}Φ @ {int(spacing_top)} mm", va='center', color='blue')
+            ax.text(bf + 30, y_slab_bot, f"{dia_trans}Φ @ {int(spacing_trans)} mm", va='center', color='blue')
+            if not shear.get('shear_safe', True):
+                ax.text((bf - bw) / 2 + bw / 2, cover + 10, f"{stirrup_legs}-legged {stirrup_dia}Φ @ {stirrup_spacing} mm",
+                        ha='center', fontsize=8, color='black')
+
+            # 7. Final settings
+            ax.set_xlim(-50, bf + 150)
+            ax.set_ylim(0, total_height + 100)
+            ax.set_aspect('equal')
+            ax.set_title("Reinforcement Layout – Typical T-Beam Section", fontsize=12)
+            ax.axis('off')
+            plt.tight_layout()
+            plt.show()
+
+        except Exception as e:
+            print(f"Error in reinforcement plotting: {str(e)}")
+
+if __name__ == "__main__":
+    try:
+        print("IRC T-Beam Bridge Design Calculator")
+        print("----------------------------------")
+        input_file = "Tee_beam.xlsx"
+        output_file = "Tee_beam.xlsx"
+        
+        design = IRCBridgeDesign(input_file)
+        design.plot_vehicle_lanes()
+        design.plot_bridge_cross_section()
+        design.print_design_summary()
+        design.plot_reinforcement_layout()
+        design.export_design_results_to_excel(input_file, output_file)
+        
+        
+    except Exception as e:
+        print(f"\nError in bridge design: {str(e)}")
